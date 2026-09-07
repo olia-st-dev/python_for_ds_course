@@ -3,7 +3,8 @@ Data preprocessing pipeline for the churn prediction dataset.
 
 Splits raw training data into train/validation sets, encodes categorical
 features (binary gender mapping + one-hot for multi-category columns),
-and optionally scales numeric features with StandardScaler.
+optionally scales numeric features with StandardScaler, and optionally
+oversamples the minority class in the training set (SMOTE or random).
 
 Two entry points:
   - preprocess_data(raw_df, ...): fits everything from scratch on training data
@@ -15,15 +16,17 @@ Two entry points:
 from typing import Optional
 
 import pandas as pd
+from imblearn.over_sampling import RandomOverSampler, SMOTE
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 TARGET_COL = ["Exited"]
-ID_COL = "id"
+ID_COL = ["id", "CustomerId", "Surname"]
 GENDER_COL = "Gender"
 GENDER_CODE_COL = "GenderCode"
 GENDER_CODES = {"Male": 0, "Female": 1}
 MULTI_CATEGORY_COLS = ["Geography"]
+OVERSAMPLE_METHODS = ("smote", "random")
 
 
 def load_csv(path: str) -> pd.DataFrame:
@@ -119,14 +122,54 @@ def apply_scaler(
     return inputs
 
 
+def oversample_train_data(
+    X_train: pd.DataFrame,
+    train_targets: pd.DataFrame,
+    method: str = "smote",
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Oversample the minority class in the training data only.
+
+    Never apply this to validation or test data — doing so would leak
+    synthetic/duplicated information into your evaluation and produce an
+    overly optimistic, misleading score.
+
+    Args:
+        X_train: Training feature matrix.
+        train_targets: Training targets (single-column DataFrame or Series).
+        method: "smote" (synthetic minority samples, generally preferred for
+            tree-based models since it avoids exact duplicates) or "random"
+            (plain duplication of minority rows).
+        random_state: Random state for reproducibility.
+
+    Returns:
+        (X_train_resampled, train_targets_resampled) with the minority class
+        upsampled to match the majority class count.
+    """
+    if method not in OVERSAMPLE_METHODS:
+        raise ValueError(f"method must be one of {OVERSAMPLE_METHODS}, got {method!r}")
+
+    y = train_targets.squeeze()
+    sampler = SMOTE(random_state=random_state) if method == "smote" else RandomOverSampler(random_state=random_state)
+    X_resampled, y_resampled = sampler.fit_resample(X_train, y)
+
+    target_name = train_targets.columns[0] if hasattr(train_targets, "columns") else "target"
+    train_targets_resampled = y_resampled.to_frame(name=target_name)
+
+    return X_resampled, train_targets_resampled
+
+
 def preprocess_data(
     raw_df: pd.DataFrame,
     target_col: list[str] = TARGET_COL,
-    id_col: str = ID_COL,
+    id_col: list[str] = ID_COL,
     gender_col: str = GENDER_COL,
     gender_code_col: str = GENDER_CODE_COL,
     multi_category_cols: Optional[list[str]] = None,
     scale_numeric: bool = True,
+    oversample: bool = False,
+    oversample_method: str = "smote",
 ) -> dict:
     """
     Run the full preprocessing pipeline on a raw training dataframe.
@@ -148,6 +191,11 @@ def preprocess_data(
         scale_numeric: Whether to fit and apply a StandardScaler to numeric
             columns. If False, numeric columns are left unscaled and
             "scaler" in the returned dict will be None.
+        oversample: Whether to oversample the minority class in X_train /
+            train_targets only (never applied to validation data). Useful
+            for imbalanced targets, e.g. with tree-based models.
+        oversample_method: "smote" (default, generates synthetic minority
+            samples) or "random" (duplicates existing minority rows).
 
     Returns:
         A dictionary with keys:
@@ -170,7 +218,7 @@ def preprocess_data(
     train_inputs, val_inputs, train_targets, val_targets = train_val_split(inputs, targets)
 
     # Identify numeric columns (based on full raw_df, matching original notebook logic)
-    numeric_cols = get_numeric_cols(raw_df, target_col, exclude_cols=[id_col])
+    numeric_cols = get_numeric_cols(raw_df, target_col, exclude_cols=id_col)
 
     # 2. Encode binary gender column
     train_inputs = add_gender_code_col(train_inputs, gender_col, gender_code_col)
@@ -192,6 +240,10 @@ def preprocess_data(
     feature_cols = numeric_cols + [gender_code_col] + encoded_cols
     X_train = train_inputs[feature_cols]
     X_val = val_inputs[feature_cols]
+
+    # 6. Optionally oversample the minority class (X_train only, never X_val)
+    if oversample:
+        X_train, train_targets = oversample_train_data(X_train, train_targets, method=oversample_method)
 
     return {
         "X_train": X_train,
